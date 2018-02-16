@@ -72,7 +72,7 @@
   ([log]
    (fetch log 0))
   ([log offset]
-   (n/fetch (get-log log) offset)))
+   (n/do-fetch (get-log log) offset)))
 
 ;; topic ref contains
 

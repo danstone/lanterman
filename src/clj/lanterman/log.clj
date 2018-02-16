@@ -13,8 +13,8 @@
     (int (n/sum-length data)))
   (cons [this o]
     (if (instance? PersistentDurableLog o)
-      (PersistentDurableLog. (n/add-to-log data (.-data ^PersistentDurableLog o)))
-      (PersistentDurableLog. (n/add-to-log data o))))
+      (PersistentDurableLog. (n/append data (.-data ^PersistentDurableLog o)))
+      (PersistentDurableLog. (n/append data o))))
   (empty [this]
     (let [{:keys [:log/optimal-slab-bytes
                   :log/root
@@ -29,15 +29,15 @@
     (= data data))
   Seqable
   (seq [this]
-    (seq (n/message-educt data)))
+    (seq (n/message-iterable data)))
   Counted
   Sequential
   IReduce
   (reduce [this f]
-    (reduce f (f) (n/message-educt data)))
+    (reduce f (f) (n/message-iterable data)))
   IReduceInit
   (reduce [this f init]
-    (reduce f init (n/message-educt data))))
+    (reduce f init (n/message-iterable data))))
 
 (defn log
   ([] (log {}))
@@ -96,6 +96,6 @@
               (let [ret (apply f (->PersistentDurableLog x) args)]
                 (if (instance? PersistentDurableLog ret)
                   (let [data (.-data ^PersistentDurableLog ret)]
-                    (n/persist storage data))
+                    (n/persist-tree storage data))
                   (throw (IllegalStateException. "Cannot return non-durable log from transact!")))))))]
     (->PersistentDurableLog newdata)))
