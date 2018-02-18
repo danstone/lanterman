@@ -3,7 +3,6 @@
   (:require [clojure.edn :as edn]
             [clojure.data.fressian :as fress]
             [riverford.durable-ref.core :as dref]
-            [riverford.durable-ref.format.fressian]
             [lanterman.nodes.persist :as persist]
             [clojure.java.io :as io])
   (:import (java.nio ByteBuffer)
@@ -69,6 +68,18 @@
   [x]
   (.array ^ByteBuffer (fress/write x)))
 
+(declare nil-buffer)
+
+(defn bufferable-node?
+  "Is this node allowed to be added to another?
+  At the moment only logs are supported."
+  [node]
+  (= :log (:node/type node)))
+
+(defn bufferable-node-inline-bytes
+  [node]
+  (+ persist/log-overhead (:tail/root-inline-bytes (:log/tail node))))
+
 (defn buffer
   "Returns an buffer node for 'x', the type of node will depend on 'x'. A buffer node always has a byte payload
   and a len in bytes.
@@ -81,7 +92,7 @@
     (bytes? x) {:node/type :node.type/buffer
                 :node/byte-count (+ persist/buffer-overhead (count ^bytes x))
                 :node/length 1
-
+                :buffer/inline-bytes (+ persist/buffer-overhead (count x))
                 :buffer/type :bytes
                 :buffer/payload x}
 
@@ -89,19 +100,24 @@
                   {:node/type :node.type/buffer
                    :node/byte-count (+ persist/buffer-overhead (count bytes))
                    :node/length 1
+                   :buffer/inline-bytes (+ persist/buffer-overhead (count bytes))
                    :buffer/type :string
                    :buffer/payload bytes})
 
-    (node? x) {:node/type :node.type/buffer
-               :node/byte-count (+ persist/buffer-overhead persist/node-overhead (sum-bytes x))
-               :node/length (sum-length x)
-               :buffer/type :node
-               :node-buffer/node x}
+    (bufferable-node? x) {:node/type :node.type/buffer
+                          :node/byte-count (+ persist/buffer-overhead persist/node-overhead (sum-bytes x))
+                          :node/length (sum-length x)
+                          :buffer/inline-bytes (+ persist/buffer-overhead (bufferable-node-inline-bytes x))
+                          :buffer/type :node
+                          :node-buffer/node x}
+
+    (nil? x) (nil-buffer 1)
 
     :else (let [bytes (fressian-bytes x)]
             {:node/type :node.type/buffer
              :node/byte-count (+ persist/buffer-overhead (count bytes))
              :node/length 1
+             :buffer/inline-bytes (+ persist/buffer-overhead (count bytes))
              :buffer/type :fressian
              :buffer/payload bytes})))
 
@@ -128,10 +144,6 @@
     (eduction cat [(eduction (mapcat buffer-iterable) nodes)
                    (eduction xf buffers)])))
 
-(defmethod buffer-iterable :node.type/pointer
-  [{:keys [:pointer/node]}]
-  (buffer-iterable node))
-
 (defmulti ^{:arglists '([node])} message-iterable
   "Returns an iterable of messages in the node."
   :node/type)
@@ -152,15 +164,15 @@
       :node (message-iterable (:node-buffer/node node)))))
 
 (declare add-node-to-tail)
-(defn- add-entry-to-tail
+(defn- add-buffer-to-tail
   [tail buffer]
   (let [{:keys [:tail/nodes
                 :tail/buffers
-                :tail/inline-bytes
+                :tail/root-inline-bytes
                 :tail/max-inline-bytes]} tail]
     (cond
       ;; entry too big, introduce indirection
-      (< max-inline-bytes (alength ^bytes (:buffer/payload buffer)))
+      (< max-inline-bytes (:buffer/inline-bytes buffer))
       (add-node-to-tail tail
                         {:node/type :node.type/slab
                          :node/length (sum-length buffer)
@@ -168,12 +180,12 @@
                          :slab/buffers [buffer]})
 
       ;; buffer will not fit in remaining inline bytes, shift tail
-      (< max-inline-bytes (+ inline-bytes (alength ^bytes (:buffer/payload buffer))))
+      (< max-inline-bytes (+ root-inline-bytes (:buffer/inline-bytes buffer)))
       {:node/type :node.type/tail
        :node/byte-count (+ persist/tail-overhead (sum-bytes tail buffer))
        :node/length (sum-length tail buffer)
 
-       :tail/inline-bytes (+ persist/tail-overhead (sum-bytes buffer))
+       :tail/root-inline-bytes (+ persist/tail-overhead (:buffer/inline-bytes buffer))
        :tail/max-inline-bytes max-inline-bytes
        :tail/nodes [tail]
        :tail/buffers [buffer]}
@@ -184,7 +196,7 @@
        :node/byte-count (sum-bytes tail buffer)
        :node/length (sum-length tail buffer)
 
-       :tail/inline-bytes (+ inline-bytes (sum-bytes buffer))
+       :tail/root-inline-bytes (+ root-inline-bytes (:buffer/inline-bytes buffer))
        :tail/max-inline-bytes max-inline-bytes
        :tail/nodes nodes
        :tail/buffers (conj (vec buffers) buffer)})))
@@ -193,21 +205,22 @@
   [tail node]
   (cond
     (empty-node? node) tail
-    (buffer? node) (add-entry-to-tail tail node)
+    (buffer? node) (add-buffer-to-tail tail node)
     ;; if we can fit all messages into inline-bytes, do so.
-    (< (+ (sum-bytes node) (:tail/inline-bytes tail)) (:tail/max-inline-bytes tail))
-    (reduce add-entry-to-tail tail (buffer-iterable node))
+    (< (+ (sum-bytes node) (:node/inline-bytes tail)) (:tail/max-inline-bytes tail))
+    (reduce add-buffer-to-tail tail (buffer-iterable node))
     :else
     (let [{:keys [:tail/nodes
                   :tail/buffers
-                  :tail/inline-bytes
+                  :node/inline-bytes
+                  :tail/root-inline-bytes
                   :tail/max-inline-bytes]} tail
           empty? (empty-node? tail)]
       {:node/type :node.type/tail
        :node/byte-count (+ (if empty? 0 persist/tail-overhead) (sum-bytes tail node))
        :node/length (sum-length tail node)
 
-       :tail/inline-bytes persist/tail-overhead
+       :tail/root-inline-bytes persist/tail-overhead
        :tail/max-inline-bytes max-inline-bytes
        :tail/nodes (if empty?
                      [node]
@@ -220,7 +233,7 @@
    :node/byte-count persist/tail-overhead
    :node/length 0
 
-   :tail/inline-bytes persist/tail-overhead
+   :tail/root-inline-bytes persist/tail-overhead
    :tail/max-inline-bytes max-inline-bytes
    :tail/nodes []
    :tail/buffers []})
@@ -229,7 +242,7 @@
   ([tail x]
    (if (node? x)
      (add-node-to-tail tail x)
-     (add-entry-to-tail tail (buffer x))))
+     (add-buffer-to-tail tail (buffer x))))
   ([tail x & more]
    (reduce add-to-tail (add-to-tail tail x) more)))
 
@@ -258,7 +271,6 @@
       {:node/type :node.type/tree
        :node/length (sum-length slab)
        :node/byte-count (+ persist/tree-overhead persist/tree-el-overhead (sum-bytes slab))
-
 
        :tree/branching-factor branching-factor
        :tree/elements [{:offset 0
@@ -333,7 +345,7 @@
   [node]
   (let [buffers (vec (buffer-iterable node))]
     {:node/type :node.type/slab
-     :node/byte-count (+ persist/slab-overhead (sum-bytes node))
+     :node/byte-count (+ persist/slab-overhead (transduce (map :node/byte-count) + 0 buffers))
      :node/length (sum-length node)
      :slab/buffers buffers}))
 
@@ -363,7 +375,8 @@
       (if (<= optimal-slab-bytes (sum-bytes tail))
         (let [newslab (node->slab tail)
               oldroot root]
-          {:old-root root
+          {:old-tail tail
+           :old-root root
            :log
            {:node/type :node.type/log
             :node/byte-count (sum-bytes log x)
@@ -372,8 +385,7 @@
             :log/root (push-slab (unref root) newslab)
             :log/tail (add-to-tail (empty-tail (:tail/max-inline-bytes tail)) x)
             :log/optimal-slab-bytes optimal-slab-bytes}})
-        {:old-root nil
-         :log
+        {:log
          {:node/type :node.type/log
           :node/byte-count (sum-bytes log x)
           :node/length (sum-length log x)
@@ -388,7 +400,7 @@
   Accepted Inputs:
    a message in bytes
    a clojure value (will be encoded as fressian)
-   another node (e.g another log)."
+   another log"
   ([log x]
    (:log (append* log x)))
   ([log x & more]
@@ -408,16 +420,20 @@
   [{:keys [:slab/buffers]}]
   buffers)
 
-(defmethod buffer-iterable :node.type/ref
-  [{:keys [:ref/uri :ref/node-type]}]
-  (buffer-iterable (dref/value
-                     ((case node-type
-                        :node.type/slab intern-slab-ref
-                        :node.type/tail intern-tail-ref
-                        :node.type/tree intern-tree-ref
-                        identity)
+(declare nil-buffer)
 
-                       (dref/reference uri)))))
+(defmethod buffer-iterable :node.type/ref
+  [{:keys [:ref/uri :ref/node-type :ref/empty?] :as node}]
+  (if empty?
+    (nil-buffer (:node/length node))
+    (buffer-iterable (dref/value
+                       ((case node-type
+                          :node.type/slab intern-slab-ref
+                          :node.type/tail intern-tail-ref
+                          :node.type/tree intern-tree-ref
+                          identity)
+
+                         (dref/reference uri))))))
 
 (defn summarise
   "Returns a simplified version of the log for inspection and tests at REPL."
@@ -438,20 +454,22 @@
     {:l (sum-length node)
      :b (sum-bytes node)}))
 
-(def memory-storage
+(defn memory-storage
   "Use with `persist` to persist the log to memory."
-  {:log-storage/slab-base-uri "mem://lanterman"
-   :log-storage/tree-base-uri "mem://lanterman"
-   :log-storage/tail-base-uri "mem://lanterman"
-   :log-storage/log-base-uri "mem://lanterman"})
+  ([logid]
+   (let [uri (str "mem://lanterman/" logid)]
+     {:log-storage/slab-base-uri uri
+      :log-storage/tree-base-uri uri
+      :log-storage/tail-base-uri uri
+      :log-storage/log-base-uri uri})))
 
 (defn file-storage
-  [dir]
-  (let [buri (str (.toURI ^File (io/file dir)))]
-    {:log-storage/slab-base-uri buri
-     :log-storage/tree-base-uri buri
-     :log-storage/tail-base-uri buri
-     :log-storage/log-base-uri buri}))
+  ([logid dir]
+   (let [buri (str (.toURI ^File (io/file dir)) logid)]
+     {:log-storage/slab-base-uri buri
+      :log-storage/tree-base-uri buri
+      :log-storage/tail-base-uri buri
+      :log-storage/log-base-uri buri})))
 
 (defn persist-logdata
   "Persists any unpersisted tree/tail nodes to storage. Does not persist the root."
@@ -459,14 +477,18 @@
   (let [{:keys [:log-storage/slab-base-uri
                 :log-storage/tree-base-uri
                 :log-storage/tail-base-uri
-                :log-storage/log-base-uri]} storage-spec]
-    (letfn [(do-persist [kind node]
+                :log-storage/log-base-uri]} storage-spec
+        {:keys [:node/length]} node]
+    (letfn [(do-persist [kind node offset garbage?]
               (let [newnode (if (= :slab kind)
                               (update node :slab/buffers (partial mapv (fn [buffer]
                                                                          (if (= :node (:buffer/type buffer))
                                                                            (update buffer :node-buffer/node persist)
                                                                            buffer))))
-                              node)]
+                              node)
+                    len (:node/length node)
+                    fname (format "")]
+                ;; todo, write to volatile ref, use prefix + segment counter
                 (str
                   (dref/uri
                     ((case kind
@@ -486,12 +508,15 @@
                                            :tail "tail"
                                            :log "log")}))))))
             (persist
-              ([node] (persist node false))
-              ([node log-root?]
+              ([node offset garbage?] (persist node offset garbage? false))
+              ([node offset garbage? log-root?]
                (case (:node/type node)
+                 :node.type/logplus (-> node
+                                        (update :logplus/message-log #(persist % 0 false log-root?))
+                                        (update :logplus/garbage-log #(persist % 0 true log-root?)))
                  :node.type/log (-> node
-                                    (update :log/root #(future (persist % log-root?)))
-                                    (update :log/tail #(future (persist % log-root?)))
+                                    (update :log/root #(future (persist % 0 garbage? log-root?)))
+                                    (update :log/tail #(future (persist % (:node/length (:log/root node)) garbage? log-root?)))
                                     (update :log/root deref)
                                     (update :log/tail deref))
                  :node.type/tree
@@ -508,7 +533,9 @@
                                  :tree
                                  (update node :tree/elements
                                          (fn [nodes]
-                                           (vec (pmap #(update % :value persist) nodes)))))}))
+                                           (vec (pmap #(update % :value (fn [node] (persist node (:offset %) garbage?))) nodes))))
+                                 offset
+                                 garbage?)}))
 
                  :node.type/slab (if (:slab/empty? node)
                                    ;; do not persist empty slabs
@@ -520,10 +547,17 @@
 
                                       :ref/persist-inst (System/currentTimeMillis)
                                       :ref/node-type :node.type/slab
-                                      :ref/uri (do-persist :slab node)}))
+                                      :ref/uri (do-persist :slab node offset garbage?)}))
 
                  :node.type/tail (if log-root?
-                                   (update node :tail/nodes (partial mapv persist))
+                                   (assoc node :tail/nodes (loop [nodes (:tail/nodes node)
+                                                                  offset offset
+                                                                  acc []]
+                                                             (if (seq nodes)
+                                                               (recur (rest nodes)
+                                                                      (+ offset (:node/length nodes))
+                                                                      (conj acc (persist (first nodes) offset garbage?)))
+                                                               acc)))
                                    (persist/add-ref-overhead
                                      {:node/type :node.type/ref
                                       :node/byte-count (sum-bytes node)
@@ -531,7 +565,7 @@
 
                                       :ref/persist-inst (System/currentTimeMillis)
                                       :ref/node-type :node.type/tail
-                                      :ref/uri (do-persist :tail node)}))
+                                      :ref/uri (do-persist :tail node offset garbage?)}))
                  node)))]
       (persist
         node
@@ -572,7 +606,6 @@
   if you wanted to use dynamodb to store log roots, you couldn't have more than say 400k bytes inline
   as there is an item size limit.
 
-
   :optimal-slab-bytes (default 512KB) (min 1KB)
   How many bytes of messages would you like your slabs to be ideally, this is approximate as messages are never split it could
   be higher or (slightly) lower. A good starting point would be say 8k for filesystems, but maybe 1MB+ for remote storage
@@ -599,14 +632,20 @@
 ;; garbage ref log
 ;; ref log
 
+(defmethod buffer-iterable :node.type/logplus
+  [node]
+  (buffer-iterable (:logplus/message-log node)))
 
 (defn logplus
   [opts]
-  (let [
+  (let [{:keys [branching-factor
+                optimal-slab-bytes
+                max-inline-bytes]} opts
+        max-inline-bytes (or max-inline-bytes 4096)
         ;;todo need to figure out inline bytes for helper logs
         ;;as probably shouldn't be the same as the message log.
-        message-log (empty-log opts)
-        garbage-log (empty-log opts)]
+        message-log (empty-log (assoc opts :max-inline-bytes (- max-inline-bytes 1024)))
+        garbage-log (empty-log (assoc opts :max-inline-bytes 1024))]
     {:node/type :node.type/logplus
      :node/byte-count 0
      :node/length 0
@@ -614,24 +653,42 @@
      :logplus/message-log message-log
      :logplus/garbage-log garbage-log}))
 
+(defn- garbage-nodes
+  [append-result]
+  (let [{:keys [old-root old-tail]} append-result]
+    (filterv some?
+             [old-root
+              old-tail])))
+
+(defn- consume-garbage
+  [garbage-log nodes]
+  (loop [nodes nodes
+         gc garbage-log]
+    (if (seq nodes)
+      (let [node (first nodes)]
+        (case (:node/type node)
+          :node.type/ref
+          (let [gc (let [append-result2 (append* garbage-log (:ref/uri node))]
+                     (consume-garbage gc (garbage-nodes append-result2)))]
+            (if (= :node.type/tail (:ref/node-type node))
+              (recur (cons (unref node) (rest nodes)) gc)
+              (recur (rest nodes) gc)))
+          :node.type/tail (recur (reduce conj (rest nodes) (:tail/nodes node)) gc)
+          (recur (rest nodes) gc)))
+      gc)))
 
 (defn append+
   ([logplus x]
    (let [{:keys [:logplus/message-log
                  :logplus/garbage-log]} logplus
-         {:keys [log old-root]} (append* message-log x)
-         garbage-log (loop [old-root old-root
-                            garbage-log garbage-log]
-                       (if (= :node.type/ref (:node/type old-root))
-                         (let [{garbage-log :log
-                                garbage-old-root :old-root} (append* garbage-log old-root)]
-                           (recur garbage-old-root garbage-log))
-                         garbage-log))]
+         append-result (append* message-log x)
+         message-log (:log append-result)
+         garbage-log (consume-garbage garbage-log (garbage-nodes append-result))]
      {:node/type :node.type/logplus
-      :node/byte-count (+ (sum-bytes garbage-log log))
-      :node/length (:node/length log)
+      :node/byte-count (+ (sum-bytes garbage-log message-log))
+      :node/length (:node/length message-log)
 
-      :logplus/message-log log
+      :logplus/message-log message-log
       :logplus/garbage-log garbage-log}))
   ([logplus x & more]
    (reduce append+ (append+ logplus x) more)))
@@ -646,6 +703,7 @@
   {:node/type :node.type/buffer
    :node/length 1
    :node/byte-count persist/buffer-overhead
+   :buffer/inline-bytes persist/buffer-overhead
    :buffer/type :nil})
 
 (defn excise
@@ -684,11 +742,12 @@
                                        newtail (if (pos? from-tail)
                                                  (! tail tail-offset from-tail)
                                                  tail)]
+
                                    (if (and (identical? newtail tail)
                                             (identical? newroot root))
                                      node
-                                     (assoc node :node/root newroot
-                                                 :node/tail newtail
+                                     (assoc node :log/root newroot
+                                                 :log/tail newtail
                                                  :node/byte-count (+ persist/log-overhead (sum-bytes newroot newtail)))))
 
                   :node.type/tree (let [{:keys [:tree/elements]} node
@@ -722,123 +781,135 @@
                   :node.type/tail (let [{:keys [:tail/buffers
                                                 :tail/max-inline-bytes
                                                 :tail/nodes]} node
+                                        on n
                                         newtail (loop [newtail (empty-tail max-inline-bytes)
                                                        nodes nodes
                                                        buffers buffers
-                                                       offset offset
+                                                       i 0
                                                        n n]
                                                   (cond
+                                                    (<= (+ offset on) i)  (as-> newtail newtail
+                                                                              (reduce add-node-to-tail newtail nodes)
+                                                                              (reduce add-buffer-to-tail newtail buffers))
                                                     (<= n 0) (as-> newtail newtail
                                                                    (reduce add-node-to-tail newtail nodes)
-                                                                   (reduce add-entry-to-tail newtail buffers))
+                                                                   (reduce add-buffer-to-tail newtail buffers))
                                                     (seq nodes) (let [node (first nodes)
-                                                                      newnode (! node offset n)]
-                                                                  (if (= node newnode)
-                                                                    (as-> newtail newtail
-                                                                          (reduce add-node-to-tail (add-node-to-tail newtail newnode) nodes)
-                                                                          (reduce add-entry-to-tail newtail buffers))
+                                                                      newnode (! node (- offset i) n)]
+                                                                  (if (identical? node newnode)
                                                                     (recur
-                                                                      (add-node-to-tail newtail node)
+                                                                      (add-node-to-tail newtail newnode)
                                                                       (rest nodes)
                                                                       buffers
-                                                                      (+ offset (- (:node/length newnode) offset))
-                                                                      (- n (- (:node/length newnode) offset)))))
-                                                    (seq buffers) (let [node (first node)
-                                                                        newnode (! node offset n)]
-                                                                    (if (= node newnode)
-                                                                      (reduce add-entry-to-tail (add-entry-to-tail newtail newnode) buffers)
+                                                                      (long (+ i (:node/length newnode)))
+                                                                      n)
+                                                                    (recur
+                                                                      (add-node-to-tail newtail newnode)
+                                                                      (rest nodes)
+                                                                      buffers
+                                                                      (long (+ i (:node/length newnode)))
+                                                                      (- n (:node/length newnode)))))
+                                                    (seq buffers) (let [node (first buffers)
+                                                                        newnode (! node (- offset i) n)]
+                                                                    (if (identical? node newnode)
                                                                       (recur
-                                                                        (add-entry-to-tail newtail newnode)
+                                                                        (add-buffer-to-tail newtail newnode)
                                                                         nil
                                                                         (rest buffers)
-                                                                        (+ offset (- (:node/length newnode) offset))
-                                                                        (- n (- (:node/length newnode) offset)))))
+                                                                        (long (+ i (:node/length newnode)))
+                                                                        n)
+                                                                      (recur
+                                                                        (add-buffer-to-tail newtail newnode)
+                                                                        nil
+                                                                        (rest buffers)
+                                                                        (long (+ i (:node/length newnode)))
+                                                                        (- n (:node/length newnode)))))
                                                     :else newtail))]
                                     (if (= newtail node)
                                       node
                                       newtail))
 
-                  :node.type/ref (let [refval (unref node)
-                                       newval (! refval offset n)]
-                                   (if (not= refval newval)
-                                     (do
-                                       (.add garbage node)
-                                       newval)
-                                     node))
+                  :node.type/ref (if (:ref/empty? node)
+                                   node
+                                   (let [refval (unref node)
+                                         newval (! refval offset n)]
+                                     (if (not= refval newval)
+                                       (do
+                                         (.add garbage node)
+                                         newval)
+                                       node)))
 
-                  :node.type/slab (let [{:keys [:slab/buffers]} node
-                                        newbuffers (loop [buffers buffers
-                                                          acc (transient [])
-                                                          offset offset
-                                                          n n]
-                                                     (if-some [buffer (first buffers)]
-                                                       (if (< offset (:node/length buffer))
-                                                         (if (< (+ offset n) (:node/length buffer))
-                                                           (-> (reduce conj! (conj! acc (! buffer offset n)) (rest buffers))
-                                                               persistent!)
-                                                           (recur (rest buffers)
-                                                                  (conj! acc (! buffer offset n))
-                                                                  (:node/length buffer)
-                                                                  (- n (- (:node/length buffer) offset))))
-                                                         (recur (rest buffers)
-                                                                (conj! acc buffer)
-                                                                offset
-                                                                n))
-                                                       (persistent! acc)))
-                                        newbuffers (loop [buffers buffers
-                                                          acc (transient [])
-                                                          last-empty nil]
-                                                     (if-some [buffer (first buffers)]
-                                                       (if (nil-buffer? buffer)
-                                                         (if last-empty
-                                                           (recur
-                                                             (rest buffers)
-                                                             acc
-                                                             (update last-empty :node/length inc))
-                                                           (recur
-                                                             (rest buffers)
-                                                             acc
-                                                             (nil-buffer 1)))
-                                                         (if last-empty
-                                                           (recur (rest buffers)
-                                                                  (-> (conj! acc last-empty)
-                                                                      (conj! buffer))
-                                                                  nil)
+                  :node.type/slab (if (:slab/empty? node)
+                                    node
+                                    (let [{:keys [:slab/buffers]} node
+                                          newbuffers (loop [buffers buffers
+                                                            acc (transient [])
+                                                            offset offset
+                                                            n n]
+                                                       (if-some [buffer (first buffers)]
+                                                         (if (< offset (:node/length buffer))
+                                                           (if (< (+ offset n) (:node/length buffer))
+                                                             (-> (reduce conj! (conj! acc (! buffer offset n)) (rest buffers))
+                                                                 persistent!)
+                                                             (recur (rest buffers)
+                                                                    (conj! acc (! buffer offset n))
+                                                                    (:node/length buffer)
+                                                                    (- n (- (:node/length buffer) offset))))
                                                            (recur (rest buffers)
                                                                   (conj! acc buffer)
-                                                                  nil)))
-                                                       (persistent! acc)))]
-                                    (if (= newbuffers buffers)
-                                      node
-                                      (assoc node :slab/buffers newbuffers
-                                                  :slab/empty? (and (= 1 (count newbuffers))
-                                                                    (nil-buffer? (first newbuffers)))
-                                                  :node/byte-count (+ persist/slab-overhead
-                                                                      (transduce (map :node/byte-count) + 0 newbuffers)))))
+                                                                  offset
+                                                                  n))
+                                                         (persistent! acc)))
+                                          newbuffers (loop [buffers buffers
+                                                            acc (transient [])
+                                                            last-empty nil]
+                                                       (if-some [buffer (first buffers)]
+                                                         (if (nil-buffer? buffer)
+                                                           (if last-empty
+                                                             (recur
+                                                               (rest buffers)
+                                                               acc
+                                                               (update last-empty :node/length inc))
+                                                             (recur
+                                                               (rest buffers)
+                                                               acc
+                                                               (nil-buffer 1)))
+                                                           (if last-empty
+                                                             (recur (rest buffers)
+                                                                    (-> (conj! acc last-empty)
+                                                                        (conj! buffer))
+                                                                    nil)
+                                                             (recur (rest buffers)
+                                                                    (conj! acc buffer)
+                                                                    nil)))
+                                                         (persistent! acc)))]
+                                      (if (= newbuffers buffers)
+                                        node
+                                        (assoc node :slab/buffers newbuffers
+                                                    :slab/empty? (and (= 1 (count newbuffers))
+                                                                      (nil-buffer? (first newbuffers)))
+                                                    :node/byte-count (+ persist/slab-overhead
+                                                                        (transduce (map :node/byte-count) + 0 newbuffers))))))
 
-                  :node.type/buffer (let [{:keys [:buffer/type]} buffer
-                                          complete? (if (+ offset n) length)]
+                  :node.type/buffer (let [{:keys [:buffer/type]} node
+                                          complete? (<= length (+ offset n))]
                                       (if complete?
                                         (nil-buffer length)
                                         (case type
-                                          :nil buffer
+                                          :nil (nil-buffer length)
                                           (:string :bytes :fressian) (nil-buffer 1)
-                                          :node )))
+                                          :node (let [newbuffer (update node :node-buffer/node ! offset n)]
+                                                  (if (= newbuffer node)
+                                                    node
+                                                    (assoc newbuffer :node/byte-count (+ persist/buffer-overhead
+                                                                                         (sum-bytes (:node-buffer/node newbuffer)))))))))
 
 
                   node))))
         new-message-log (f message-log offset n)]
     (if (= message-log new-message-log)
       logplus
-      (let [new-garbage-log (loop [log garbage-log
-                                   old-refs (seq garbage)]
-                              (if (seq old-refs)
-                                (let [{:keys [old-root
-                                              log]} (append* log (first old-refs))]
-                                  (if (= :node.type/ref (:node/type old-root))
-                                    (recur log (cons old-root (rest old-refs)))
-                                    (recur log (rest old-refs))))
-                                log))]
+      (let [new-garbage-log (consume-garbage garbage-log (seq garbage))]
         {:node/type :node.type/logplus
          :node/byte-count (+ (sum-bytes new-message-log new-garbage-log))
          :node/length (:node/length new-message-log)
@@ -846,7 +917,95 @@
          :logplus/message-log new-message-log
          :logplus/garbage-log new-garbage-log}))))
 
+(defn nil-slab
+  [n]
+  (assoc (node->slab (nil-buffer n)) :slab/empty? true))
+
+(defn nil-ref
+  [n]
+  {:node/type :node.type/ref
+   :node/byte-count persist/refnode-overhead
+   :node/length n
+   :ref/empty? true
+   :ref/node-type :node.type/slab})
+
 (defn reclaim
   [logplus before-ms]
-  ;; truncates log by removing messages older than before-ms.
-  )
+  ;; truncates log by removing messages older than before-ms, replacing with nil buffers
+  (let [garbage (ArrayList.)
+        {:keys [:logplus/message-log
+                :logplus/garbage-log]} logplus
+        stop? (volatile! false)
+        f (fn ! [node]
+            (if @stop?
+              node
+              (case (:node/type node)
+                :node.type/log (let [{:keys [:log/root
+                                             :log/tail]} node
+                                     newroot (! root)]
+                                 (cond
+                                   (= newroot root) node
+                                   :else
+                                   (assoc node :log/root newroot
+                                               :node/byte-count (+ persist/log-overhead (sum-bytes newroot tail)))))
+                :node.type/tree (let [{:keys [:tree/elements]} node
+                                      newelements (vec (for [el elements
+                                                             :let [newel (update el :value !)]]
+                                                         (if (= newel el)
+                                                           el
+                                                           (assoc newel :bytes (+ persist/tree-el-overhead (sum-bytes (:value newel)))))))]
+                                  (if (= elements newelements)
+                                    node
+                                    (assoc node
+                                      :tree/elements elements
+                                      :node/byte-count (+ persist/tree-overhead (transduce (map :bytes) + 0 newelements)))))
+                :node.type/ref (let [{:keys [:ref/persist-inst]} node]
+                                 (cond
+                                   (:ref/empty? node) node
+                                   (< persist-inst before-ms) (do
+                                                                (.add garbage node)
+                                                                (nil-ref (:node/length node)))
+                                   (= :node.type/slab (:ref/node-type node)) (do
+                                                                               (vreset! stop? true)
+                                                                               node)
+                                   :else (let [refval (unref node)
+                                               newval (! node)]
+                                           (if (= refval newval)
+                                             node
+                                             (do
+                                               (.add garbage node)
+                                               newval)))))
+                :node.type/slab (if (:slab/empty? node)
+                                  node
+                                  (let [{:keys [:slab/buffers
+                                                :slab/empty?]} node
+                                        newbuffers (mapv ! buffers)]
+                                    (cond
+                                      (= newbuffers buffers) node
+
+                                      (every? (fn [buffer] (= :nil (:buffer/type buffer))) newbuffers)
+                                      (nil-slab (sum-length node))
+
+                                      :else
+                                      (assoc node :slab/buffers newbuffers
+                                                  :node/byte-count (+ persist/slab-overhead
+                                                                      (transduce (map :node/byte-count) + 0 newbuffers))))))
+
+                :node.type/buffer (if (= :node (:buffer/type node))
+                                    (let [newbuffer (update buffer :node-buffer/node !)]
+                                      (if (= newbuffer node)
+                                        node
+                                        (assoc newbuffer :node/byte-count (+ persist/buffer-overhead (sum-bytes (:node-buffer/node newbuffer))))))
+                                    node)
+
+                node)))
+        new-message-log (f message-log)]
+    (if (= new-message-log message-log)
+      logplus
+      (let [new-garbage-log (consume-garbage garbage-log (seq garbage))]
+        {:node/type :node.type/logplus
+         :node/byte-count (+ (sum-bytes new-message-log new-garbage-log))
+         :node/length (:node/length new-message-log)
+
+         :logplus/message-log new-message-log
+         :logplus/garbage-log new-garbage-log}))))

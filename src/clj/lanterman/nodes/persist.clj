@@ -22,7 +22,11 @@
                 :node/byte-count
                 :buffer/payload
                 :buffer/type]} node
-        totallen byte-count
+        payload (case type
+                  :node (node-array (:node-buffer/node node))
+                  :nil nil
+                  payload)
+        totallen (+ buffer-overhead (count payload))
         buf (ByteBuffer/allocate totallen)]
     (.put buf (byte (case type
                       :bytes 0
@@ -32,16 +36,9 @@
                       :nil 4)))
     (.putLong buf byte-count)
     (.putLong buf length)
-    (case type
-      :node
-      (let [payload (node-array (:node-buffer/node node))]
-        (.putInt buf (count payload))
-        (.put buf ^bytes payload))
-      :nil
-      (.putInt buf 0)
-      (do
-        (.putInt buf (count payload))
-        (.put buf ^bytes payload)))
+    (.putInt buf (count payload))
+    (when (some? payload)
+      (.put buf ^bytes payload))
     (.array buf)))
 
 (defn read-buffer
@@ -61,17 +58,20 @@
         {:node/type :node.type/buffer
          :node/byte-count byte-count
          :node/length length
+         :buffer/inline-bytes (+ buffer-overhead payload-len)
          :buffer/type buffer-type
          :node-buffer/node node})
       :nil {:node/type :node.type/buffer
             :node/byte-count byte-count
             :node/length length
+            :buffer/inline-bytes (+ buffer-overhead payload-len)
             :buffer/type buffer-type}
       (let [payload (byte-array payload-len)]
         (.get buf payload)
         {:node/type :node.type/buffer
          :node/byte-count byte-count
          :node/length length
+         :buffer/inline-bytes  (+ buffer-overhead payload-len)
          :buffer/type buffer-type
          :buffer/payload payload}))))
 
@@ -153,7 +153,7 @@
   [tail]
   (let [{:keys [:node/byte-count
                 :node/length
-                :tail/inline-bytes
+                :tail/root-inline-bytes
                 :tail/max-inline-bytes
                 :tail/nodes
                 :tail/buffers]} tail
@@ -166,7 +166,7 @@
     (.putInt buf totallen)
     (.putLong buf byte-count)
     (.putLong buf length)
-    (.putInt buf inline-bytes)
+    (.putInt buf root-inline-bytes)
     (.putInt buf max-inline-bytes)
     (.putInt buf (count nodes))
     (run! (fn [arr] (.put buf ^bytes arr)) node-arrays)
@@ -201,7 +201,7 @@
     {:node/type :node.type/tail
      :node/byte-count byte-count
      :node/length length
-     :tail/inline-bytes inline-bytes
+     :tail/root-inline-bytes inline-bytes
      :tail/max-inline-bytes max-inline-bytes
      :tail/nodes nodes
      :tail/buffers buffers}))
@@ -328,8 +328,11 @@
                 :node/length
                 :ref/persist-inst
                 :ref/node-type
+                :ref/empty?
                 :ref/uri]} refnode
-        ^bytes uribytes (.getBytes ^String uri "UTF-8")
+        ^bytes uribytes (if empty?
+                          (byte-array 0)
+                          (.getBytes ^String uri "UTF-8"))
         totallen (+ refnode-overhead (alength uribytes))
         buf (ByteBuffer/allocate totallen)]
     (.putLong buf byte-count)
@@ -355,22 +358,28 @@
                     2 :node.type/tail
                     3 :node.type/tree)
         urilen (.getInt buf)
-        uriarr (byte-array urilen)]
+        uriarr (byte-array urilen)
+        empty? (= (count uriarr) 0)]
     (.get buf uriarr)
-    {:node/type :node.type/ref
-     :node/length length
-     :node/byte-count byte-count
-     :ref/persist-inst persist-inst
-     :ref/node-type node-type
-     :ref/uri (String. uriarr "UTF-8")}))
+    (cond->
+      {:node/type :node.type/ref
+       :node/length length
+       :node/byte-count byte-count
+       :ref/persist-inst persist-inst
+       :ref/node-type node-type}
+      empty? (assoc :ref/empty? true)
+      (not empty?) (assoc :ref/uri (String. uriarr "UTF-8")))))
 
 (defn add-ref-overhead
   [ref]
   (let [{:keys [:node/byte-count
-                :ref/uri]} ref]
-    (assoc ref
-      :node/byte-count
-      (+ byte-count refnode-overhead (count (.getBytes ^String uri "UTF-8"))))))
+                :ref/empty?
+                :ref/uri]} ref
+        newbyte-count (if empty?
+                        (+ byte-count refnode-overhead)
+                        (+ byte-count refnode-overhead (count (.getBytes ^String uri "UTF-8"))))]
+    (assoc ref :node/byte-count newbyte-count
+               :node/inline-bytes newbyte-count)))
 
 (def ^:const log-overhead
   (+
@@ -424,6 +433,51 @@
         log (read-log buf {})]
     log))
 
+(def ^:const logplus-overhead
+  (+
+    4
+    8
+    8))
+
+(defn logplus-array
+  [logplus]
+  (let [{:keys [:node/byte-count
+                :node/length
+                :logplus/message-log
+                :logplus/garbage-log]} logplus
+        ^bytes message-array (log-array message-log)
+        ^bytes garbage-array (garbage-log garbage-log)
+        totallen (+ logplus-overhead (count message-array) (count garbage-array))
+        buf (ByteBuffer/allocate totallen)]
+    (.putInt buf totallen)
+    (.putLong buf byte-count)
+    (.putLong buf length)
+    (.put buf message-array)
+    (.put buf garbage-array)))
+
+(defn read-logplus
+  [^ByteBuffer buf]
+  (.getInt buf)
+  (let [byte-count (.getLong buf)
+        length (.getLong buf)
+        messages (read-log buf {})
+        garbage (read-log buf {})]
+    {:node/type :node.type/logplus
+     :node/byte-count byte-count
+     :node/length length
+     :logplus/message-log messages
+     :logplus/garbage-log garbage}))
+
+(defmethod dref/serialize "logplus"
+  [node _ opts]
+  (logplus-array node))
+
+(defmethod dref/deserialize "logplus"
+  [^bytes arr _ opts]
+  (let [buf (ByteBuffer/wrap arr)
+        log (read-logplus buf)]
+    log))
+
 (def ^:const node-overhead
   (+
     ;; totallen
@@ -440,7 +494,8 @@
               :node.type/tail (tail-array node)
               :node.type/tree (tree-array node)
               :node.type/ref (ref-array node)
-              :node.type/log (log-array node))
+              :node.type/log (log-array node)
+              :node.type/logplus (logplus-array node))
         totallen (+ node-overhead (alength ^bytes arr))
         buf (ByteBuffer/allocate totallen)]
     (.putInt buf totallen)
@@ -450,7 +505,8 @@
                       :node.type/tail 2
                       :node.type/tree 3
                       :node.type/ref 4
-                      :node.type/log 5)))
+                      :node.type/log 5
+                      :node.type/logplus 6)))
     (.put buf ^bytes arr)
     (.array buf)))
 
@@ -464,11 +520,13 @@
                     2 :node.type/tail
                     3 :node.type/tree
                     4 :node.type/ref
-                    5 :node.type/log)]
+                    5 :node.type/log
+                    6 :node.type/logplus)]
     (case node-type
       :node.type/buffer (read-buffer buf)
       :node.type/slab (read-slab buf {})
       :node.type/tail (read-tail buf {})
       :node.type/tree (read-tree buf {})
       :node.type/ref (read-ref buf)
-      :node.type/log (read-log buf {}))))
+      :node.type/log (read-log buf {})
+      :node.type/logplus (read-logplus buf))))
