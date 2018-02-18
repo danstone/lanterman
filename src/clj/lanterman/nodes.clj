@@ -481,10 +481,33 @@
         {:keys [:node/length]} node]
     (letfn [(do-persist [kind node offset garbage?]
               (let [newnode (if (= :slab kind)
-                              (update node :slab/buffers (partial mapv (fn [buffer]
-                                                                         (if (= :node (:buffer/type buffer))
-                                                                           (update buffer :node-buffer/node persist)
-                                                                           buffer))))
+                              (let [buffers (:slab/buffers node)
+                                    buffer-count (count buffers)
+                                    newbuffers
+                                    (loop [acc (transient [])
+                                           idx 0
+                                           i (long offset)]
+                                      (if (< idx buffer-count)
+                                        (let [n (nth buffers idx)]
+                                          (if (= :node (:buffer/type n))
+                                            (let [cn (:node-buffer/node n)
+                                                  rn (persist cn i garbage?)
+                                                  byte-delta (- (:node/byte-count rn)
+                                                                (:node/byte-count cn))]
+                                              (recur
+                                                (conj! acc
+                                                       (assoc n :node-buffer/node rn
+                                                                :node/byte-count (+ persist/buffer-overhead
+                                                                                    (sum-bytes rn))
+                                                                :node/inline-bytes (+ persist/buffer-overhead
+                                                                                      byte-delta)))
+                                                (inc idx)
+                                                (long (+ i (:node/length n)))))
+                                            (recur (conj! acc n) (inc idx) (long (+ i (:node/length n))))))
+                                        (persistent! acc)))]
+                                (assoc node :slab/buffers newbuffers
+                                            :node/byte-count (+ persist/slab-overhead
+                                                                (transduce (map :node/byte-count) + 0 newbuffers))))
                               node)
                     len (:node/length node)
                     fname (format "")]
@@ -555,7 +578,7 @@
                                                                   acc []]
                                                              (if (seq nodes)
                                                                (recur (rest nodes)
-                                                                      (+ offset (:node/length nodes))
+                                                                      (+ offset (:node/length (first nodes)))
                                                                       (conj acc (persist (first nodes) offset garbage?)))
                                                                acc)))
                                    (persist/add-ref-overhead
@@ -569,6 +592,8 @@
                  node)))]
       (persist
         node
+        0
+        false
         true))))
 
 (defmulti do-fetch (fn [node offset] (:node/type node)))
@@ -668,8 +693,8 @@
       (let [node (first nodes)]
         (case (:node/type node)
           :node.type/ref
-          (let [gc (let [append-result2 (append* garbage-log (:ref/uri node))]
-                     (consume-garbage gc (garbage-nodes append-result2)))]
+          (let [gc (let [append-result2 (append* gc (:ref/uri node))]
+                     (consume-garbage (:log append-result2) (garbage-nodes append-result2)))]
             (if (= :node.type/tail (:ref/node-type node))
               (recur (cons (unref node) (rest nodes)) gc)
               (recur (rest nodes) gc)))
@@ -753,28 +778,29 @@
                   :node.type/tree (let [{:keys [:tree/elements]} node
                                         newelements (loop [elements elements
                                                            acc (transient [])
-                                                           offset offset
+                                                           i 0
                                                            n n]
-                                                      (if-some [element (first elements)]
-                                                        (if (< offset (:length element))
-                                                          (if (< (+ offset n) (:length element))
-                                                            (-> (reduce conj! (conj! acc (update element :value ! offset n)) (rest elements))
-                                                                persistent!)
+                                                      (let [noffset (- offset i)]
+                                                        (if-some [element (first elements)]
+                                                          (if (< noffset (:length element))
+                                                            (if (< (+ noffset n) (:length element))
+                                                              (-> (reduce conj! (conj! acc (update element :value ! noffset n)) (rest elements))
+                                                                  persistent!)
+                                                              (recur (rest elements)
+                                                                     (conj! acc (update element :value ! noffset n))
+                                                                     (long (+ i (:length element)))
+                                                                     (- n (:length element))))
                                                             (recur (rest elements)
-                                                                   (conj! acc (update element :value ! offset n))
-                                                                   (:length element)
-                                                                   (- n (- (:length element) offset))))
-                                                          (recur (rest elements)
-                                                                 (conj! acc element)
-                                                                 offset
-                                                                 n))
-                                                        (persistent! acc)))]
+                                                                   (conj! acc element)
+                                                                   (long (+ i (:length element)))
+                                                                   n))
+                                                          (persistent! acc))))]
                                     (if (not= newelements elements)
                                       (let [newelements (vec (for [element newelements
                                                                    :let [newel (assoc element
                                                                                  :node/byte-count (+ persist/tree-el-overhead (sum-bytes (:value element))))]]
                                                                newel))]
-                                        (assoc node :node/elements newelements
+                                        (assoc node :tree/elements newelements
                                                     :node/byte-count (+ persist/tree-el-overhead (reduce + 0 (map :bytes newelements)))))
                                       node))
 
@@ -844,23 +870,24 @@
                                     (let [{:keys [:slab/buffers]} node
                                           newbuffers (loop [buffers buffers
                                                             acc (transient [])
-                                                            offset offset
+                                                            i 0
                                                             n n]
-                                                       (if-some [buffer (first buffers)]
-                                                         (if (< offset (:node/length buffer))
-                                                           (if (< (+ offset n) (:node/length buffer))
-                                                             (-> (reduce conj! (conj! acc (! buffer offset n)) (rest buffers))
-                                                                 persistent!)
+                                                       (let [noffset (- offset i)]
+                                                         (if-some [buffer (first buffers)]
+                                                           (if (< noffset (:node/length buffer))
+                                                             (if (< (+ noffset n) (:node/length buffer))
+                                                               (-> (reduce conj! (conj! acc (! buffer noffset n)) (rest buffers))
+                                                                   persistent!)
+                                                               (recur (rest buffers)
+                                                                      (conj! acc (! buffer noffset n))
+                                                                      (long (+ i (:node/length buffer)))
+                                                                      (- n (:node/length buffer))))
                                                              (recur (rest buffers)
-                                                                    (conj! acc (! buffer offset n))
-                                                                    (:node/length buffer)
-                                                                    (- n (- (:node/length buffer) offset))))
-                                                           (recur (rest buffers)
-                                                                  (conj! acc buffer)
-                                                                  offset
-                                                                  n))
-                                                         (persistent! acc)))
-                                          newbuffers (loop [buffers buffers
+                                                                    (conj! acc buffer)
+                                                                    (long (+ i (:node/length buffer)))
+                                                                    n))
+                                                           (persistent! acc))))
+                                          newbuffers (loop [buffers newbuffers
                                                             acc (transient [])
                                                             last-empty nil]
                                                        (if-some [buffer (first buffers)]
