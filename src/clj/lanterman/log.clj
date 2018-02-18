@@ -96,6 +96,6 @@
               (let [ret (apply f (->PersistentDurableLog x) args)]
                 (if (instance? PersistentDurableLog ret)
                   (let [data (.-data ^PersistentDurableLog ret)]
-                    (n/persist-tree storage data))
+                    (n/persist-logdata storage data))
                   (throw (IllegalStateException. "Cannot return non-durable log from transact!")))))))]
     (->PersistentDurableLog newdata)))

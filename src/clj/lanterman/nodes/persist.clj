@@ -1,7 +1,10 @@
 (ns lanterman.nodes.persist
+  "Defines how to serialize/deserialize the multiple node types."
   (:require [riverford.durable-ref.core :as dref])
   (:import (java.nio ByteBuffer HeapByteBuffer)
            (java.io BufferedOutputStream InputStream DataInputStream)))
+
+(declare node-array read-node)
 
 (set! *warn-on-reflection* true)
 
@@ -19,17 +22,26 @@
                 :node/byte-count
                 :buffer/payload
                 :buffer/type]} node
-        totallen (+ (count payload) buffer-overhead)
+        totallen byte-count
         buf (ByteBuffer/allocate totallen)]
     (.put buf (byte (case type
                       :bytes 0
                       :node 1
                       :string 2
-                      :fressian 3)))
+                      :fressian 3
+                      :nil 4)))
     (.putLong buf byte-count)
     (.putLong buf length)
-    (.putInt buf (count payload))
-    (.put buf ^bytes payload)
+    (case type
+      :node
+      (let [payload (node-array (:node-buffer/node node))]
+        (.putInt buf (count payload))
+        (.put buf ^bytes payload))
+      :nil
+      (.putInt buf 0)
+      (do
+        (.putInt buf (count payload))
+        (.put buf ^bytes payload)))
     (.array buf)))
 
 (defn read-buffer
@@ -38,17 +50,30 @@
                       0 :bytes
                       1 :node
                       2 :string
-                      3 :fressian)
+                      3 :fressian
+                      4 :nil)
         byte-count (.getLong buf)
         length (.getLong buf)
-        payload-len (.getInt buf)
-        payload (byte-array payload-len)]
-    (.get buf payload)
-    {:node/type :node.type/buffer
-     :node/byte-count byte-count
-     :node/length length
-     :buffer/type buffer-type
-     :buffer/payload payload}))
+        payload-len (.getInt buf)]
+    (case buffer-type
+      :node
+      (let [node (read-node buf {})]
+        {:node/type :node.type/buffer
+         :node/byte-count byte-count
+         :node/length length
+         :buffer/type buffer-type
+         :node-buffer/node node})
+      :nil {:node/type :node.type/buffer
+            :node/byte-count byte-count
+            :node/length length
+            :buffer/type buffer-type}
+      (let [payload (byte-array payload-len)]
+        (.get buf payload)
+        {:node/type :node.type/buffer
+         :node/byte-count byte-count
+         :node/length length
+         :buffer/type buffer-type
+         :buffer/payload payload}))))
 
 (def ^:const slab-overhead
   (+
@@ -82,17 +107,19 @@
     (.getInt buf))
   (let [byte-count (.getLong buf)
         length (.getLong buf)
-        buffer-count (.getInt buf)]
+        buffer-count (.getInt buf)
+        buffers (loop [v (transient [])
+                       i (int 0)]
+                  (if (< i buffer-count)
+                    (recur
+                      (conj! v (read-buffer buf))
+                      (unchecked-add-int i 1))
+                    (persistent! v)))]
     {:node/type :node.type/slab
      :node/byte-count byte-count
      :node/length length
-     :slab/buffers (loop [v (transient [])
-                          i (int 0)]
-                     (if (< i buffer-count)
-                       (recur
-                         (conj! v (read-buffer buf))
-                         (unchecked-add-int i 1))
-                       (persistent! v)))}))
+     :slab/empty? (every? (fn [buffer] (= :nil (:buffer/type buffer))) buffers)
+     :slab/buffers buffers}))
 
 
 (defmethod dref/serialize "slab"
@@ -121,8 +148,6 @@
     4
     ;;buffers cnt
     4))
-
-(declare node-array read-node)
 
 (defn tail-array
   [tail]
@@ -295,12 +320,13 @@
     tree))
 
 (def ^:const refnode-overhead
-  (+ 8 8 1 4))
+  (+ 8 8 8 1 4))
 
 (defn ref-array
   [refnode]
   (let [{:keys [:node/byte-count
                 :node/length
+                :ref/persist-inst
                 :ref/node-type
                 :ref/uri]} refnode
         ^bytes uribytes (.getBytes ^String uri "UTF-8")
@@ -308,6 +334,7 @@
         buf (ByteBuffer/allocate totallen)]
     (.putLong buf byte-count)
     (.putLong buf length)
+    (.putLong buf persist-inst)
     (.put buf (byte (case node-type
                       :node.type/buffer 0
                       :node.type/slab 1
@@ -321,6 +348,7 @@
   [^ByteBuffer buf]
   (let [byte-count (.getLong buf)
         length (.getLong buf)
+        persist-inst (.getLong buf)
         node-type (case (.get buf)
                     0 :node.type/buffer
                     1 :node.type/slab
@@ -332,6 +360,7 @@
     {:node/type :node.type/ref
      :node/length length
      :node/byte-count byte-count
+     :ref/persist-inst persist-inst
      :ref/node-type node-type
      :ref/uri (String. uriarr "UTF-8")}))
 
@@ -357,7 +386,7 @@
                 :log/root
                 :log/tail
                 :log/optimal-slab-bytes]} log
-        ^bytes root-array (tree-array root)
+        ^bytes root-array (node-array root)
         ^bytes tail-array (tail-array tail)
         totallen (+ log-overhead (count root-array) (count tail-array))
         buf (ByteBuffer/allocate totallen)]
@@ -376,7 +405,7 @@
   (let [byte-count (.getLong buf)
         length (.getLong buf)
         optimal-slab-bytes (.getInt buf)
-        root (read-tree buf {})
+        root (read-node buf {})
         tail (read-tail buf {})]
     {:node/type :node.type/log
      :node/byte-count byte-count
@@ -392,7 +421,7 @@
 (defmethod dref/deserialize "log"
   [^bytes arr _ opts]
   (let [buf (ByteBuffer/wrap arr)
-        log (read-log buf {:skip-totallen? true})]
+        log (read-log buf {})]
     log))
 
 (def ^:const node-overhead

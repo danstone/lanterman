@@ -1,7 +1,8 @@
 (ns lanterman.util
   (:require [clojure.string :as str])
   (:import (java.util.concurrent ScheduledThreadPoolExecutor ScheduledExecutorService TimeUnit ScheduledFuture)
-           (java.lang AutoCloseable)))
+           (java.lang AutoCloseable)
+           (java.util Random)))
 
 
 (defonce ^:private ^ScheduledExecutorService executor-scheduler
@@ -104,3 +105,9 @@
   (if-some [idx (str/last-index-of s ".")]
     (subs s 0 idx)
     s))
+
+(defn random-bytes
+  [n]
+  (let [arr (byte-array n)]
+    (.nextBytes (Random.) arr)
+    arr))
